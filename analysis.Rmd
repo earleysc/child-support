@@ -1,0 +1,209 @@
+---
+title: "Analysis: Maryland child support caseload data"
+author: "Christine Zhang"
+date: "2/26/2020"
+output:
+  html_document
+---
+
+The Baltimore Sun analyzed data on child support cases in the public child support system (also known as IV-D cases) across Maryland during the 2018 federal fiscal year. The data was provided by the Maryland Department of Human Services in response to a public records request and used in a Feb. 26, 2020 story titled ["xxx
+"](xxx).
+
+Note the raw caseload data is saved in the `input/` folder and was pre-processed using the `cleaning.Rmd` script prior to analysis.
+
+Here are the key data elements reported in the story: 
+
+**Child support arrears debt by ZIP code**: 
+- Several Baltimore city ZIP codes owe millions in back child support, including one West Baltimore ZIP code which owes $23 million in arrears. 
+- In 10 city ZIP codes, about 15,000 parents collectively owe more than $233 million.
+
+**Child support as welfare cost recovery**: 
+- Collectively in the state, non-custodial parents owe the government $156 million in back child support to repay welfare benefits, including $73 million in Baltimore.
+
+**License suspensions by Maryland's child support agency**: 
+- Nearly 40,000 people had their driver's license suspended by Maryland’s child support agency as of September 2018. More than a third of those drivers lived in Baltimore.
+- Some 1,900 professional and recreational licenses had been suspended by the state, including 750 in Baltimore, in September 2018.
+- Statewide, about 320 suspended professional licenses were for certified medication technicians. Another 150 were rideshare licenses. About 225 barbers and 120 certified nursing assistants had their occupational privileges blocked.
+
+**Child support debt among older non-custodial parents**:
+- Among noncustodial parents 62 or older, nearly two-thirds had back payments owed in September 2018.
+
+### Load R libraries
+
+```{r load, warning = F, message = F}
+library('tidyverse')
+library('tidycensus')
+library('readxl')
+library('janitor')
+library('sf')
+```
+
+### Read in the pre-processed caseload and license suspensions data
+
+See the pre-processing code at `cleaning.Rmd` for detail on how the caseload data was cleaned prior to analysis.
+
+```{r read, warning = F, message = F}
+caseload <- read_rds('output/caseload.rds') # statewide caseload
+baci_caseload <- read_rds('output/baci_caseload.rds') # caseload for Baltimore city
+drivers_license_suspensions <- read_excel('input/MPIA Aug 7.xlsx', sheet = 'DL Suspensions') %>% clean_names()
+professional_license_suspensions <- read_excel('input/MPIA Aug 7.xlsx', sheet = 'PL Suspensions') %>% clean_names()
+```
+
+**A note on the geographical analysis of the data**: The Maryland Department of Human Services provided the ZIP code on file for non-custodial parents, which is how we were able to extract Baltimore city-specific figures as well as analyze the data geoographically. However, ZIP codes are not an ideal unit for analysis as they are [not spatial entities](http://mcdc.missouri.edu/geography/ZIP-resources.html). Additionally, some Baltimore city ZIP codes overlap with those in Baltimore County. For mapping and demographic purposes we use the Census Bureau's [ZIP code tabulation areas](https://www.census.gov/programs-surveys/geography/guidance/geo-areas/zctas.html).
+
+### Child support arrears debt by ZIP code
+
+*Finding: Several Baltimore city ZIP codes owe millions in back child support, including one West Baltimore ZIP code which owes $23 million in arrears.* 
+
+*Finding: In 10 city ZIP codes, about 15,000 parents collectively owe more than $233 million.*
+
+Create a data frame, `baci_arrears.zips`, that groups the Baltimore city caseload data by ZIP code to get the arrears that are owed by ZIP code. Use the `cumsum()` command to calculate the cumulative sum of arrears.
+
+Merge with `baci_caseload.ncps.zips`, which provides the number of non-custodial parents in each city ZIP code that owe arrears.
+
+```{r zips}
+baci_caseload.ncps.zips <- baci_caseload %>% filter(arrears_owed_total_september_2018 > 0) %>%
+  select(ncp_zip, ncp_id) %>% 
+  distinct() %>% 
+  group_by(ncp_zip) %>%
+  summarise(number_of_ncps = n()) 
+  
+baci_arrears.zips <- 
+baci_caseload %>% group_by(ncp_zip) %>% 
+  summarise(arrears = sum(arrears_owed_total_september_2018, 
+                          na.rm = T)) %>% 
+  arrange(desc(arrears)) %>% 
+  ungroup() %>%
+  mutate(cumulative = cumsum(arrears)) %>% 
+  merge(baci_caseload.ncps.zips) %>%
+  arrange(desc(arrears)) %>% 
+  mutate(cumulative_ncps = cumsum(number_of_ncps))
+```
+
+Filter `baci_arrears.zips` to see the 10 ZIP codes that owe the most arrears. As shown below, the arrears in these ZIP codes each total 15+ million.
+
+In West Baltimore [ZIP code 21216](https://www.google.com/maps/place/Baltimore,+MD+21216/@39.3108441,-76.6951786,14z/data=!3m1!4b1!4m5!3m4!1s0x89c81b6c23e6c4a9:0x777eeef9b68e99da!8m2!3d39.3096984!4d-76.6701475), $23.4 million is owed in child support arrears.
+
+In these top 10 ZIP codes, 15,012 parents collectively owe $233.5 million in arrears (see `cumulative_ncps` and `cumulative` columns in the last row).
+
+```{r zips_top10}
+baci_arrears.zips %>% head(10)
+```
+
+Merge `baci_arrears.zips` with Census data on poverty from the [2014-18 American Community Survey](https://www.census.gov/newsroom/press-releases/2019/acs-5-year.html) and [total prison population as of 2010](https://www.prisonpolicy.org/origin/md/zipcodes.html) for [this interactive map](https://www.datawrapper.de/_/iyfEd/). 
+
+```{r map}
+### Read in prison incarceration rate data
+md_prison <- read_csv('input/prisonpop_10.csv') %>% clean_names()
+
+### Get poverty data by zip code
+v18.s <- load_variables(2018, "acs5/subject", cache = TRUE)
+pov <- get_acs(geography = "zcta",
+                 variables = c(poverty.rate = "S1701_C03_001"),
+                 year = 2018,
+                 output = 'wide')
+
+### Merge poverty, prison and arrears data
+pov.merged <- merge(baci_arrears.zips,
+                    pov,
+                    by.x = 'ncp_zip',
+                    by.y = 'GEOID',
+                    all.x = T)
+
+pov.prison.merged <- merge(pov.merged,
+                           md_prison,
+                           by.x = 'ncp_zip',
+                           by.y = 'zipcode_tabulation_areas',
+                           all.x = T) %>%
+  mutate(arrears = arrears/1000000)
+
+pov.prison.merged %>% filter(!is.na(poverty.rateE)) %>% 
+  write_csv('output/zipcodes_baci_map.csv')
+```
+
+## Child support as welfare cost recovery
+
+*Finding: Collectively in the state, non-custodial parents owe the government $156 million in back child support to repay welfare benefits, including $73 million in Baltimore.*
+
+Sum the `state_owed_arrears_total_september_2018` column in the `caseload` and `baci_caseload` dataframes to determine the total amount government-owed arrears in Maryland and Baltimore city.
+
+```{r state_owed}
+print(paste("In Maryland, non-custodial parents owe", 
+            round(sum(caseload$state_owed_arrears_total_september_2018, na.rm = T)/1000000),
+            "million in back child support to repay welfare benefits, including",
+            round(sum(baci_caseload$state_owed_arrears_total_september_2018, na.rm = T)/1000000),
+            "million in Baltimore."))
+```
+
+### License suspensions by Maryland's child support agency
+
+*Finding: Nearly 40,000 people had their driver's license suspended by Maryland’s child support agency as of September 2018. More than a third of those drivers lived in Baltimore.*
+
+Sum the `cases` column in the `drivers_license_suspensions` dataframe to get the number of cases of suspended licenses. In this analysis, we assume each case corresponds to a separate driver since it is a point-in-time snapshot of September 2018. Note that some of the non-custodial parents in this data have ZIP codes (`ncp_zip`) outside of Maryland. We include these in the number as these are parents with licenses suspended by Maryland's child support agency.
+
+```{r drivers_licenses}
+print(paste(sum(drivers_license_suspensions$cases),
+            "drivers had their license suspended by Maryland's child support agency as of September 2018."))
+```
+
+In order to get the Baltimore city number, we use the `ncp_zip` to include only non-custodial parents with [Baltimore city zip codes](https://planning.maryland.gov/MSDC/Pages/zipcode_map/2015-16/zip15-16idx.aspx).
+
+```{r baci_drivers_licenses}
+baci.zips <- st_read('input/bacizc15/bacizc15.shp')
+baci.zips.licenses <- merge(baci.zips,
+                            drivers_license_suspensions,
+                            by.x = 'ZIPCODE1',
+                            by.y = 'ncp_zip')
+
+print(paste(sum(baci.zips.licenses$cases),
+            "drivers living in Baltimore had their license suspended by the Maryland child support agency, or",
+            round(sum(baci.zips.licenses$cases)/sum(drivers_license_suspensions$cases) * 100, 2), "percent."))
+```
+
+*Finding: Some 1,900 professional and recreational licenses had been suspended by the state, including 750 in Baltimore, in September 2018.*
+
+Sum the `cases` column in the `professional_license_suspensions` dataframe to get the number of cases of suspended licenses. Note that some of the non-custodial parents in this data have ZIP codes (`ncp_zip`) outside of Maryland. We include these in the number as these are parents with licenses suspended by Maryland's child support agency.
+
+```{r professional_licenses}
+print(paste(sum(professional_license_suspensions$cases),
+            "professional and recreational licenses were suspended by Maryland's child support agency as of September 2018."))
+```
+
+*Finding: Statewide, about 320 suspended professional licenses were for certified medication technicians. Another 150 were rideshare licenses. About 225 barbers and 120 certified nursing assistants had their occupational privileges blocked.*
+
+```{r professional_licenses_categories}
+professional_license_suspensions.cats <- professional_license_suspensions %>% 
+  group_by(license_description) %>% 
+  summarise(cases = sum(cases)) %>% 
+  arrange(desc(cases))
+
+print(paste(professional_license_suspensions.cats[professional_license_suspensions.cats$license_description == 'CERTIFIED MEDICATION TECHNICIAN',]$cases, 
+            "suspended professional licenses were for certified medication technicians."))
+
+print(paste(professional_license_suspensions.cats[professional_license_suspensions.cats$license_description == 'TNOTNC',]$cases, 
+            "suspended professional licenses were rideshare licenses")) # https://www.psc.state.md.us/wp-content/uploads/TNO-Brochure-for-website_07312018.pdf - Transportation Network Operator/Transportation Network Company licenes
+
+print(paste(sum(professional_license_suspensions.cats[grepl("BARBER+", professional_license_suspensions.cats$license_description),]$cases), 
+            "suspended professional licenses were for barbers."))
+
+print(paste(professional_license_suspensions.cats[professional_license_suspensions.cats$license_description == 'CERTIFIED NURSING ASSISTANT',]$cases, 
+            "suspended professional licenses were for certified nursing assistants."))
+```
+
+### Child support debt among older non-custodial parents
+
+*Finding: Among noncustodial parents 62 or older, nearly two-thirds had back payments owed in September 2018.*
+
+```{r age}
+print(paste(round(caseload[caseload$ncp_age >= 62 & 
+         caseload$arrears_owed_total_september_2018 > 0,] %>% nrow() / 
+caseload[caseload$ncp_age >= 62, ] %>% nrow() * 100),
+"percent of non-custodial parents aged 62 or older had back payments owed in September 2018."))
+```
+
+
+
+
+
+
+

@@ -1,0 +1,297 @@
+---
+title: 'Cleaning: Maryland child support caseload data'
+author: "Christine Zhang"
+date: "2/26/2020"
+output:   
+  md_document:
+    variant: markdown_github
+---
+
+## Cleaning: Maryland child support caseload data
+
+In August 2019, The Baltimore Sun received a response to a public records request for a database of child support cases in the public child support system (also known as IV-D cases) across Maryland during the 2018 federal fiscal year (which ran from October 1, 2017 to September 30, 2018). The raw Excel file as received from the Maryland Department of Human Services is saved as `MPIA Aug 7.xlsx`.
+
+The R code in this document cleans the caseload data to make it suitable for analysis and completes some initial data integrity checks.
+
+### Load R libraries
+
+```{r load, warning = F, message = F}
+library('tidyverse')
+library('janitor')
+library('readxl')
+library('sf')
+```
+
+### Read in the data
+
+```{r read, warning = F, message = F}
+options(digits = 10)
+caseload <- read_excel('input/MPIA Aug 7.xlsx') %>% clean_names()
+```
+
+### Filter to include only active (i.e., open) cases
+
+The code key describing the meaning of each of the codes is in the second tab of the Excel spreadsheet ("Code Key").
+
+```{r filter}
+caseload <- caseload %>% filter(case_status == 'ATV')
+```
+
+### Modify zip code column to make sure it is 5 digits
+
+Because Excel [converts text to numbers](https://github.com/Quartz/bad-data-guide#text-has-been-converted-to-numbers) when there are leading zeroes and makes them 4-digits, we use `str_pad()` to get the leading zeros back in the noncustodial parent zip code column, `ncp_zip`, and ensure the values are 5 digits.
+
+```{r zip}
+caseload <- caseload %>% mutate(ncp_zip = str_pad(ncp_zip, 5, pad = '0', side = 'left'))
+```
+
+### Calculate age of noncustodial parents
+
+Use the birth year of the noncustodial parent, `ncp_birth_year`, in order to calculate their age at the end of 2019. A small number of birth years are almost certainly incorrectly recorded: for example, some are recorded as having been born in 2017 or 2018, or in 1900 (likely a [stand-in for no data](https://github.com/Quartz/bad-data-guide#spreadsheet-has-dates-in-1900-1904-1969-or-1970)). 
+
+For analysis purposes, we will put `NA` in the calculated age column, `ncp_age`, if the calculated age of the noncustodial parent is older than 90 or younger than 18.
+
+```{r age}
+caseload <- caseload %>% mutate(ncp_age = ifelse(2019-ncp_birth_year < 18 | 2019-ncp_birth_year > 90, NA,
+                                                 2019-ncp_birth_year))
+```
+
+### Caculate variables of interest over the fiscal year
+For analysis purposes, we will construct the following variables for fy2018:
+- `current_support_due_fy18`: current support due over fy2018
+- `current_support_distributed_fy18`: current support paid over fy2018
+- `arrears_owed_total_october_2017`: total arrears owed as of October 2017
+- `arrears_owed_total_september_2018`: total arrears owed as of September 2018
+- `arrears_owed_total_october_2017_os`: total arrears owed as of October 2017, including out-of-state arrears
+- `arrears_owed_total_september_2018_os`: total arrears owed as of September 2018, including out-of-state arrears
+- `arrears_distributed_fy18`: arrears paid over fy2018
+
+```{r calculate}
+caseload <- caseload %>% rowwise() %>% 
+  mutate(current_support_due_fy18 = 
+           sum(current_support_due_october_2017, 
+               current_support_due_november_2017,
+               current_support_due_december_2017,
+               current_support_due_january_2018,
+               current_support_due_february_2018,
+               current_support_due_march_2018,
+               current_support_due_april_2018,
+               current_support_due_may_2018,
+               current_support_due_june_2018,
+               current_support_due_july_2018,
+               current_support_due_august_2018,
+               current_support_due_september_2018, 
+               na.rm = T),
+         current_support_distributed_fy18 = 
+           sum(current_support_distributed_october_2017, 
+               current_support_distributed_november_2017,
+               current_support_distributed_december_2017,
+               current_support_distributed_january_2018,
+               current_support_distributed_february_2018,
+               current_support_distributed_march_2018,
+               current_support_distributed_april_2018,
+               current_support_distributed_may_2018,
+               current_support_distributed_june_2018,
+               current_support_distributed_july_2018,
+               current_support_distributed_august_2018,
+               current_support_distributed_september_2018, 
+               na.rm = T),
+         arrears_owed_total_september_2018 = sum(state_owed_arrears_total_september_2018, custodial_parent_owed_arrears_total_september_2018, na.rm = T),
+         arrears_owed_total_october_2017 = sum(state_owed_arrears_total_october_2017, custodial_parent_owed_arrears_total_october_2017, na.rm = T),
+         arrears_owed_total_september_2018_os = sum(state_owed_arrears_total_september_2018, custodial_parent_owed_arrears_total_september_2018, out_of_state_arrears_total_september_2018, na.rm = T),
+         arrears_owed_total_october_2017_os = sum(state_owed_arrears_total_october_2017, custodial_parent_owed_arrears_total_october_2017, out_of_state_arrears_total_october_2017, na.rm = T),
+         arrears_distributed_fy18 = sum(arrears_distributed_october_2017,
+                                        arrears_distributed_november_2017,
+                                        arrears_distributed_december_2017,
+                                        arrears_distributed_january_2018,
+                                        arrears_distributed_february_2018,
+                                        arrears_distributed_march_2018,
+                                        arrears_distributed_april_2018,
+                                        arrears_distributed_may_2018,
+                                        arrears_distributed_june_2018,
+                                        arrears_distributed_july_2018,
+                                        arrears_distributed_august_2018,
+                                        arrears_distributed_september_2018, na.rm = T))
+```
+
+### Create a separate data frame for Baltimore city noncustodial parents
+
+For Baltimore-specific analyses, we will create a separate dataframe, `baci_caseload`, that includes child support cases from noncustodial parents with Baltimore city zip codes on record, using `ncp_zip`. 
+
+Note we do not use the `ldss_name` or `ldss_id`, as these refer to the jurisidiction in which the court order was established, not the residence of the noncustodial parent. A noncustodial parent who lives in Baltimore city could have a child support case tht was opened in a different county if the custodial parent lived in that county. For example, here are the juridictions for cases in which the noncustodial parent had a 21201 zip code (Downtown Baltimore):
+
+```{r zips}
+caseload %>% filter(ncp_zip == '21201') %>% select(ldss_name) %>% table()
+```
+We would want to include all of these cases in our Baltimore city analysis as all of them describe noncustodial parents living in Baltimore, regardless of where the case originated.
+
+In order to include Baltimore city zip codes, we will use zip code area shape files from the Maryland Department of Planning's [State Data Center](https://planning.maryland.gov/MSDC/Pages/zipcode_map/2015-16/zip15-16idx.aspx).
+
+Note the caveat that some Baltimore city zip codes overlap with Baltimore county zip codes.
+
+```{r baltimore_zips}
+baci_zips <- st_read('input/bacizc15/bacizc15.shp')
+baco_zips <- st_read('input/bacozc15/bacozc15.shp')
+
+# these city zip codes spill over into the county
+baci_zips %>% filter(ZIPCODE1 %in% baco_zips$ZIPCODE1) %>% as.data.frame() %>% distinct(ZIPCODE1)
+# baci.zips %>% filter(ZIPCODE1 %in% baco.zips$ZIPCODE1) %>% ggplot() + geom_sf()
+
+# keep all the NCP cases in the caseload data that also have ZIP codes in Baltimore City
+baci_caseload <- caseload %>% merge(baci_zips, 
+                                 by.x = 'ncp_zip', 
+                                 by.y = 'ZIPCODE1', 
+                                 all.y = T) %>% 
+  as.data.frame() %>% 
+  select(-geometry, -OBJECTID, -AREA, -PERIMETER, -STATEZIP_2, -STATEZIP_3, -ZIPCODE2, -ZIPNAME) %>%
+  filter(!is.na(ncp_id)) %>% distinct()
+```
+
+## Data checks
+
+Researchers at the [University of Maryland School of Social Work](https://familywelfare.umaryland.edu/recentpubs.htm) have analyzed the characteristics of noncustodial parents based on a sample of noncustodial parents who had an active child support case in July 2017 (see ["Noncustodial Parent Snapshots: Examining Who Owed Support in July 2017"](https://familywelfare.umaryland.edu/reports1/Noncustodial%20Parent%20Snapshots%20July%202017.pdf)). As a validity check, we will compare some overall statistics calculated using our data with the reported figure. Note there will not be an exact match as the University of Maryland School of Social Work report is as of July 2017, whereas our data is as of September 2018.
+
+### Maryland checks
+
+#### According to the report, 169,833 noncustodial parents had a case in July 2017 statewide. Here's that number as of September 2018.
+
+```{r check_cases_md}
+print(caseload %>% distinct(ncp_id) %>% nrow())
+```
+
+#### According to the report, 92% of noncustodial parents were men. Here's that number as of September 2018.
+
+```{r check_gender_md}
+print(caseload %>% distinct(ncp_id, 
+                      ncp_gender_code) %>% 
+  group_by(ncp_gender_code) %>%
+  summarise(n = n()) %>% 
+  mutate(perc = n/sum(n) * 100))
+```
+
+#### According to the report, 41 was the average age of a noncustodial parent. Here's that number as of September 2018.
+```{r check_age_md}
+print(summary(caseload$ncp_age))
+```
+
+#### According to the report, 71% of noncustodial parents had a current support order, owing an average of $5,766 in one year. Here are those numbers as of September 2018.
+```{r check_orders_md}
+print(caseload %>% filter(monthly_current_support_ordered_amount_september_2018 > 0) %>% 
+  distinct(ncp_id) %>% 
+  nrow() / 
+  caseload %>% distinct(ncp_id) %>% nrow() * 100)
+
+print(mean(caseload[caseload$monthly_current_support_ordered_amount_september_2018 > 0, ]$monthly_current_support_ordered_amount_september_2018, na.rm = T) * 12)
+```
+
+#### According to the report, 67% of current support was collected and 86% of noncustodial parents had a current support order payment. Here are those numbers using data from fiscal 2018.
+```{r check_collections_md}
+print(sum(caseload$current_support_distributed_fy18)/sum(caseload$current_support_due_fy18) * 100)
+
+print(caseload %>% filter(current_support_distributed_fy18 > 0) %>% distinct(ncp_id) %>% nrow() / 
+  caseload %>% filter(monthly_current_support_ordered_amount_september_2018 > 0 | monthly_current_support_ordered_amount_october_2017 | monthly_current_support_ordered_amount_september_2018 > 0) %>% 
+  distinct(ncp_id) %>% nrow() * 100)
+```
+
+#### According to the report, three in five noncustodial parents owed arrears and $9,792 was the median amount owed. Here are those numbers as of fiscal 2018
+```{r check_arrears_md}
+print(caseload %>% filter(arrears_owed_total_september_2018_os > 0 | arrears_owed_total_october_2017_os > 0) %>% 
+  distinct(ncp_id) %>% nrow() / caseload %>%  distinct(ncp_id) %>% nrow() * 100)
+
+print(caseload %>% filter(arrears_owed_total_september_2018_os > 0) %>% 
+        group_by(ncp_id) %>%
+        summarise(arrears = sum(arrears_owed_total_september_2018_os)) %>%
+        ungroup() %>%
+        select(arrears) %>%
+        summary()) # note the median here is lower than the figure in the UMD report
+```
+# According to the report, the average noncustodial parent had 1 case and 2 children. Here are those numbers as of September 2018
+
+```{r check_children_md}
+print(caseload %>% group_by(ncp_id) %>% 
+        summarise(number_of_cases = n()) %>% select(number_of_cases) %>% summary()) 
+
+print(caseload %>% group_by(ncp_id) %>% filter(number_of_participating_children_september_2018 > 0) %>%
+        summarise(number_of_children = sum(number_of_participating_children_september_2018)) %>% 
+        select(number_of_children) %>% summary())
+```
+
+### Baltimore checks
+
+#### According to the report, 38,918 noncustodial parents had a case in July 2017 statewide. Here's that number as of September 2018.
+
+```{r check_cases_baci}
+print(baci_caseload %>% distinct(ncp_id) %>% nrow())
+```
+
+#### According to the report, 92% of noncustodial parents were men. Here's that number as of September 2018.
+
+```{r check_gender_baci}
+print(baci_caseload %>% distinct(ncp_id, 
+                      ncp_gender_code) %>% 
+  group_by(ncp_gender_code) %>% 
+  summarise(n = n()) %>% 
+  mutate(perc = n/sum(n) * 100))
+```
+
+#### According to the report, 41 was the average age of a noncustodial parent. Here's that number as of September 2018.
+```{r check_age_baci}
+print(summary(baci_caseload$ncp_age))
+```
+
+#### According to the report, 56% of noncustodial parents had a current support order, owing an average of $5,766 in one year. Here are those numbers as of September 2018.
+```{r check_orders_baci}
+print(baci_caseload %>% filter(monthly_current_support_ordered_amount_september_2018 > 0) %>% 
+  distinct(ncp_id) %>% 
+  nrow() / 
+  baci_caseload %>% distinct(ncp_id) %>% nrow() * 100)
+
+print(mean(baci_caseload[baci_caseload$monthly_current_support_ordered_amount_september_2018 > 0, ]$monthly_current_support_ordered_amount_september_2018, na.rm = T) * 12)
+```
+
+#### According to the report, 55% of current support was collected and 80% of noncustodial parents had a current support order payment. Here are those numbers using data from fiscal 2018.
+```{r check_collections_baci}
+print(sum(baci_caseload$current_support_distributed_fy18)/sum(baci_caseload$current_support_due_fy18) * 100)
+
+print(baci_caseload %>% filter(current_support_distributed_fy18 > 0) %>% distinct(ncp_id) %>% nrow() / 
+  baci_caseload %>% filter(monthly_current_support_ordered_amount_september_2018 > 0 | monthly_current_support_ordered_amount_october_2017 | monthly_current_support_ordered_amount_september_2018 > 0) %>% 
+  distinct(ncp_id) %>% nrow() * 100)
+```
+
+#### According to the report, two in three noncustodial parents owed arrears and $9,792 was the median amount owed. Here are those numbers as of fiscal 2018
+
+```{r check_arrears_baci}
+print(baci_caseload %>% filter(arrears_owed_total_september_2018_os > 0 | arrears_owed_total_october_2017_os > 0) %>% 
+  distinct(ncp_id) %>% nrow() / baci_caseload %>% distinct(ncp_id) %>% nrow() * 100)
+
+print(baci_caseload %>% filter(arrears_owed_total_september_2018_os > 0) %>% 
+      group_by(ncp_id) %>%
+      summarise(arrears = sum(arrears_owed_total_september_2018_os)) %>%
+      ungroup() %>%
+      select(arrears) %>%
+      summary()) # note the median here is lower than the figure in the UMD report
+```
+#### According to the report, the average noncustodial parent had 2 cases and 2 children. Here are those numbers as of September 2018
+
+```{r check_children_baci}
+print(baci_caseload %>% group_by(ncp_id) %>% 
+        summarise(number_of_cases = n()) %>% select(number_of_cases) %>% summary()) 
+
+print(baci_caseload %>% group_by(ncp_id) %>% filter(number_of_participating_children_september_2018 > 0) %>%
+        summarise(number_of_children = sum(number_of_participating_children_september_2018)) %>% 
+        select(number_of_children) %>% summary())
+```
+
+## Save Maryland and Baltimore city caseload dataframes
+
+```{r save}
+write_rds(caseload, 'output/caseload.rds')
+write_rds(baci_caseload, 'output/baci_caseload.rds')
+```
+
+
+
+
+
+
+
